@@ -204,7 +204,7 @@ class DownloadWorker @AssistedInject constructor(
     }
 
     private fun scanMediaFile(file: File) {
-        androidx.media.MediaScannerCompat.scanFile(
+        android.media.MediaScannerConnection.scanFile(
             context,
             arrayOf(file.absolutePath),
             null,
