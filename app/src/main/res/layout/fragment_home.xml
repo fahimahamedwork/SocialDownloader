@@ -27,8 +27,7 @@
                 android:text="Social Downloader"
                 android:textSize="28sp"
                 android:textStyle="bold"
-                android:textColor="@color/text_primary"
-                android:fontFamily="@font/inter_bold" />
+                android:textColor="@color/text_primary" />
 
             <TextView
                 android:layout_width="wrap_content"
