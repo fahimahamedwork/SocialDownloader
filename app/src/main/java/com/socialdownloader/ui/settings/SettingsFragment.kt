@@ -8,7 +8,10 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.fragment.app.Fragment
 import androidx.fragment.app.viewModels
+import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModel
+import androidx.lifecycle.lifecycleScope
+import androidx.lifecycle.repeatOnLifecycle
 import androidx.lifecycle.viewModelScope
 import com.socialdownloader.databinding.FragmentSettingsBinding
 import dagger.hilt.android.AndroidEntryPoint
@@ -143,24 +146,26 @@ class SettingsFragment : Fragment() {
     }
 
     private fun observeSettings() {
-        viewLifecycleOwner.lifecycleScope.launchWhenStarted {
-            viewModel.settings.collect { settings ->
-                binding.switchWifiOnly.isChecked = settings.wifiOnlyDownload
-                binding.switchAutoScan.isChecked = settings.autoScanMedia
-                binding.switchNotifications.isChecked = settings.showNotifications
-                binding.switchAutoClipboard.isChecked = settings.autoDetectClipboard
+        viewLifecycleOwner.lifecycleScope.launch {
+            viewLifecycleOwner.repeatOnLifecycle(Lifecycle.State.STARTED) {
+                viewModel.settings.collect { settings ->
+                    binding.switchWifiOnly.isChecked = settings.wifiOnlyDownload
+                    binding.switchAutoScan.isChecked = settings.autoScanMedia
+                    binding.switchNotifications.isChecked = settings.showNotifications
+                    binding.switchAutoClipboard.isChecked = settings.autoDetectClipboard
 
-                when (settings.defaultQuality) {
-                    "1080p" -> binding.radio1080p.isChecked = true
-                    "720p" -> binding.radio720p.isChecked = true
-                    "480p" -> binding.radio480p.isChecked = true
-                    "360p" -> binding.radio360p.isChecked = true
-                }
+                    when (settings.defaultQuality) {
+                        "1080p" -> binding.radio1080p.isChecked = true
+                        "720p" -> binding.radio720p.isChecked = true
+                        "480p" -> binding.radio480p.isChecked = true
+                        "360p" -> binding.radio360p.isChecked = true
+                    }
 
-                when (settings.theme) {
-                    "light" -> binding.radioLight.isChecked = true
-                    "dark" -> binding.radioDark.isChecked = true
-                    else -> binding.radioSystem.isChecked = true
+                    when (settings.theme) {
+                        "light" -> binding.radioLight.isChecked = true
+                        "dark" -> binding.radioDark.isChecked = true
+                        else -> binding.radioSystem.isChecked = true
+                    }
                 }
             }
         }
