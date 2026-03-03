@@ -48,6 +48,42 @@ class VideoExtractorService @Inject constructor(
         }
     }
 
+    /**
+     * Fetches the file size using a HEAD request to get Content-Length header.
+     * Returns -1 if the size cannot be determined.
+     */
+    private suspend fun fetchFileSize(url: String): Long = withContext(Dispatchers.IO) {
+        try {
+            val request = Request.Builder()
+                .url(url)
+                .head()
+                .addHeader("User-Agent", DESKTOP_USER_AGENT)
+                .build()
+            val response = okHttpClient.newCall(request).execute()
+            if (response.isSuccessful) {
+                val contentLength = response.body?.contentLength() ?: -1
+                Timber.d("File size for $url: $contentLength bytes")
+                contentLength
+            } else {
+                Timber.w("Failed to fetch file size, HTTP ${response.code}")
+                -1L
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "Error fetching file size for $url")
+            -1L
+        }
+    }
+
+    /**
+     * Fetches file sizes for multiple format URLs in parallel.
+     */
+    private suspend fun fetchFileSizes(formats: List<VideoFormat>): List<VideoFormat> = withContext(Dispatchers.IO) {
+        formats.map { format ->
+            val size = fetchFileSize(format.url)
+            format.copy(fileSize = size)
+        }
+    }
+
     // ─── YouTube ──────────────────────────────────────────────────────────────
 
     private suspend fun extractYoutube(url: String): Result<VideoInfo> {
@@ -60,7 +96,8 @@ class VideoExtractorService @Inject constructor(
             ?: return Result.failure(Exception("Failed to fetch YouTube metadata"))
 
         // Build video formats (YouTube requires proper API or yt-dlp for actual stream URLs)
-        val formats = buildYoutubeFormats(videoId)
+        val baseFormats = buildYoutubeFormats(videoId)
+        val formats = fetchFileSizes(baseFormats)
         val thumbnailUrl = "https://img.youtube.com/vi/$videoId/maxresdefault.jpg"
 
         val info = VideoInfo(
@@ -130,7 +167,7 @@ class VideoExtractorService @Inject constructor(
 
         val videoId = extractTikTokVideoId(resolvedUrl) ?: System.currentTimeMillis().toString()
 
-        val formats = listOf(
+        val baseFormats = listOf(
             VideoFormat("hd", "HD", "720p", 0, "mp4",
                 "https://api.socialdownloader.app/tt/$videoId/hd"),
             VideoFormat("sd", "SD", "480p", 0, "mp4",
@@ -138,6 +175,7 @@ class VideoExtractorService @Inject constructor(
             VideoFormat("audio", "Audio", "Audio Only", 0, "mp3",
                 "https://api.socialdownloader.app/tt/$videoId/audio", isAudioOnly = true)
         )
+        val formats = fetchFileSizes(baseFormats)
 
         return Result.success(
             VideoInfo(
@@ -173,12 +211,13 @@ class VideoExtractorService @Inject constructor(
         val thumbnail = json?.optString("thumbnail_url") ?: ""
         val author = json?.optString("author_name") ?: ""
 
-        val formats = listOf(
+        val baseFormats = listOf(
             VideoFormat("hd", "HD", "720p", 0, "mp4",
                 "https://api.socialdownloader.app/ig/$mediaId/hd"),
             VideoFormat("sd", "SD", "480p", 0, "mp4",
                 "https://api.socialdownloader.app/ig/$mediaId/sd")
         )
+        val formats = fetchFileSizes(baseFormats)
 
         return Result.success(
             VideoInfo(
@@ -216,12 +255,13 @@ class VideoExtractorService @Inject constructor(
         val thumbnail = json?.optString("thumbnail_url") ?: ""
         val author = json?.optString("author_name") ?: ""
 
-        val formats = listOf(
+        val baseFormats = listOf(
             VideoFormat("hd", "HD", "720p", 0, "mp4",
                 "https://api.socialdownloader.app/fb/$videoId/hd"),
             VideoFormat("sd", "SD", "480p", 0, "mp4",
                 "https://api.socialdownloader.app/fb/$videoId/sd")
         )
+        val formats = fetchFileSizes(baseFormats)
 
         return Result.success(
             VideoInfo(
@@ -253,12 +293,13 @@ class VideoExtractorService @Inject constructor(
         val tweetId = Regex("status/(\\d+)").find(url)?.groupValues?.get(1)
             ?: return Result.failure(Exception("Invalid Twitter URL"))
 
-        val formats = listOf(
+        val baseFormats = listOf(
             VideoFormat("hd", "HD", "720p", 0, "mp4",
                 "https://api.socialdownloader.app/tw/$tweetId/hd"),
             VideoFormat("sd", "SD", "360p", 0, "mp4",
                 "https://api.socialdownloader.app/tw/$tweetId/sd")
         )
+        val formats = fetchFileSizes(baseFormats)
 
         return Result.success(
             VideoInfo(
@@ -293,7 +334,7 @@ class VideoExtractorService @Inject constructor(
         val author = json?.optString("author_name") ?: ""
         val duration = json?.optInt("duration", 0)?.toLong() ?: 0
 
-        val formats = listOf(
+        val baseFormats = listOf(
             VideoFormat("1080p", "1080p", "1920x1080", 0, "mp4",
                 "https://api.socialdownloader.app/vm/$videoId/1080"),
             VideoFormat("720p", "720p", "1280x720", 0, "mp4",
@@ -301,6 +342,7 @@ class VideoExtractorService @Inject constructor(
             VideoFormat("360p", "360p", "640x360", 0, "mp4",
                 "https://api.socialdownloader.app/vm/$videoId/360")
         )
+        val formats = fetchFileSizes(baseFormats)
 
         return Result.success(
             VideoInfo(
@@ -335,12 +377,13 @@ class VideoExtractorService @Inject constructor(
         val duration = json?.optLong("duration") ?: 0
         val views = json?.optLong("views_total") ?: 0
 
-        val formats = listOf(
+        val baseFormats = listOf(
             VideoFormat("720p", "HD", "1280x720", 0, "mp4",
                 "https://api.socialdownloader.app/dm/$videoId/720"),
             VideoFormat("480p", "SD", "854x480", 0, "mp4",
                 "https://api.socialdownloader.app/dm/$videoId/480")
         )
+        val formats = fetchFileSizes(baseFormats)
 
         return Result.success(
             VideoInfo(
@@ -372,12 +415,13 @@ class VideoExtractorService @Inject constructor(
         val postId = Regex("comments/([a-z0-9]+)").find(url)?.groupValues?.get(1)
             ?: System.currentTimeMillis().toString()
 
-        val formats = listOf(
+        val baseFormats = listOf(
             VideoFormat("hd", "HD", "720p", 0, "mp4",
                 "https://api.socialdownloader.app/rd/$postId/hd"),
             VideoFormat("sd", "SD", "480p", 0, "mp4",
                 "https://api.socialdownloader.app/rd/$postId/sd")
         )
+        val formats = fetchFileSizes(baseFormats)
 
         return Result.success(
             VideoInfo(
@@ -420,9 +464,10 @@ class VideoExtractorService @Inject constructor(
             return Result.failure(Exception("No video found on this page"))
         }
 
-        val formats = listOf(
+        val baseFormats = listOf(
             VideoFormat("default", "Default", "auto", 0, "mp4", videoUrl)
         )
+        val formats = fetchFileSizes(baseFormats)
 
         return Result.success(
             VideoInfo(

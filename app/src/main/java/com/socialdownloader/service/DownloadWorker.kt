@@ -85,6 +85,12 @@ class DownloadWorker @AssistedInject constructor(
             }
 
             val contentLength = body.contentLength()
+            
+            // Update file size in database if we got a valid content length
+            if (contentLength > 0) {
+                repository.updateFileSize(downloadId, contentLength)
+            }
+            
             var downloadedBytes = 0L
 
             FileOutputStream(outputFile).use { outputStream ->

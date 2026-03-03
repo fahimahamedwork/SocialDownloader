@@ -57,6 +57,9 @@ class DownloadRepository @Inject constructor(
     suspend fun markFailed(id: Long, error: String) =
         dao.updateStatus(id, DownloadStatus.FAILED, error)
 
+    suspend fun updateFileSize(id: Long, fileSize: Long) =
+        dao.updateFileSize(id, fileSize)
+
     suspend fun cancelDownload(id: Long) =
         dao.updateStatus(id, DownloadStatus.CANCELLED)
 

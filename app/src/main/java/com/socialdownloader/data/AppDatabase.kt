@@ -76,6 +76,9 @@ interface DownloadDao {
     @Query("UPDATE downloads SET status = 'COMPLETED', completedAt = :time, filePath = :path WHERE id = :id")
     suspend fun markCompleted(id: Long, time: Long, path: String)
 
+    @Query("UPDATE downloads SET fileSize = :fileSize WHERE id = :id")
+    suspend fun updateFileSize(id: Long, fileSize: Long)
+
     @Delete
     suspend fun deleteDownload(item: DownloadItem)
 
