@@ -5,8 +5,11 @@ import com.socialdownloader.data.model.VideoFormat
 import com.socialdownloader.data.model.VideoInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import timber.log.Timber
 import javax.inject.Inject
@@ -16,31 +19,51 @@ import javax.inject.Singleton
  * VideoExtractorService
  *
  * Handles metadata fetching and video URL extraction for multiple platforms.
- * Each platform has a dedicated extractor strategy.
- *
- * NOTE: In a production app, this would integrate with a backend API
- * (e.g., yt-dlp server) for robust extraction. This class demonstrates
- * the architecture with real HTTP parsing logic.
+ * Uses cobalt.tools API for video extraction.
  */
 @Singleton
 class VideoExtractorService @Inject constructor(
     private val okHttpClient: OkHttpClient
 ) {
+    
+    companion object {
+        private const val COBALT_API = "https://api.cobalt.tools/api/json"
+        private const val DESKTOP_USER_AGENT =
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+        private const val MOBILE_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36"
+    }
+
     suspend fun extractVideoInfo(url: String): Result<VideoInfo> = withContext(Dispatchers.IO) {
         return@withContext try {
             val platform = Platform.fromUrl(url)
             Timber.d("Extracting video info for platform: $platform, url: $url")
 
-            when (platform) {
-                Platform.YOUTUBE -> extractYoutube(url)
-                Platform.INSTAGRAM -> extractInstagram(url)
-                Platform.TIKTOK -> extractTikTok(url)
-                Platform.FACEBOOK -> extractFacebook(url)
-                Platform.TWITTER -> extractTwitter(url)
-                Platform.VIMEO -> extractVimeo(url)
-                Platform.DAILYMOTION -> extractDailymotion(url)
-                Platform.REDDIT -> extractReddit(url)
-                else -> extractGeneric(url, platform)
+            // First get metadata from the page
+            val metadata = fetchPageMetadata(url, platform)
+            
+            // Then get download URL from cobalt API
+            val downloadInfo = fetchFromCobalt(url)
+            
+            if (downloadInfo == null) {
+                Result.failure(Exception("Could not extract video. The video may be private or unavailable."))
+            } else {
+                val info = VideoInfo(
+                    id = metadata.id,
+                    title = metadata.title,
+                    description = "",
+                    thumbnailUrl = metadata.thumbnail,
+                    duration = metadata.duration,
+                    platform = platform,
+                    originalUrl = url,
+                    uploader = metadata.author,
+                    uploaderAvatarUrl = "",
+                    viewCount = 0,
+                    likeCount = 0,
+                    formats = downloadInfo,
+                    uploadDate = ""
+                )
+                Result.success(info)
             }
         } catch (e: Exception) {
             Timber.e(e, "Error extracting video info")
@@ -48,491 +71,199 @@ class VideoExtractorService @Inject constructor(
         }
     }
 
-    /**
-     * Fetches the file size using a HEAD request to get Content-Length header.
-     * Returns -1 if the size cannot be determined.
-     */
-    private suspend fun fetchFileSize(url: String): Long = withContext(Dispatchers.IO) {
-        try {
-            val request = Request.Builder()
-                .url(url)
-                .head()
-                .addHeader("User-Agent", DESKTOP_USER_AGENT)
-                .build()
-            val response = okHttpClient.newCall(request).execute()
-            if (response.isSuccessful) {
-                val contentLength = response.body?.contentLength() ?: -1
-                Timber.d("File size for $url: $contentLength bytes")
-                contentLength
-            } else {
-                Timber.w("Failed to fetch file size, HTTP ${response.code}")
-                -1L
-            }
-        } catch (e: Exception) {
-            Timber.w(e, "Error fetching file size for $url")
-            -1L
-        }
-    }
+    private data class PageMetadata(
+        val id: String,
+        val title: String,
+        val thumbnail: String,
+        val duration: Long,
+        val author: String
+    )
 
-    /**
-     * Fetches file sizes for multiple format URLs in parallel.
-     */
-    private suspend fun fetchFileSizes(formats: List<VideoFormat>): List<VideoFormat> = withContext(Dispatchers.IO) {
-        formats.map { format ->
-            val size = fetchFileSize(format.url)
-            format.copy(fileSize = size)
-        }
-    }
-
-    // ─── YouTube ──────────────────────────────────────────────────────────────
-
-    private suspend fun extractYoutube(url: String): Result<VideoInfo> {
-        val videoId = extractYoutubeVideoId(url)
-            ?: return Result.failure(Exception("Invalid YouTube URL"))
-
-        // Use YouTube oEmbed for metadata (publicly available)
-        val oembedUrl = "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=$videoId&format=json"
-        val response = fetchJson(oembedUrl)
-            ?: return Result.failure(Exception("Failed to fetch YouTube metadata"))
-
-        // Build video formats (YouTube requires proper API or yt-dlp for actual stream URLs)
-        val baseFormats = buildYoutubeFormats(videoId)
-        val formats = fetchFileSizes(baseFormats)
-        val thumbnailUrl = "https://img.youtube.com/vi/$videoId/maxresdefault.jpg"
-
-        val info = VideoInfo(
-            id = videoId,
-            title = response.optString("title", "YouTube Video"),
-            description = "",
-            thumbnailUrl = thumbnailUrl,
-            duration = 0,
-            platform = Platform.YOUTUBE,
-            originalUrl = url,
-            uploader = response.optString("author_name", "Unknown"),
-            uploaderAvatarUrl = "",
-            viewCount = 0,
-            likeCount = 0,
-            formats = formats,
-            uploadDate = ""
-        )
-        return Result.success(info)
-    }
-
-    private fun extractYoutubeVideoId(url: String): String? {
-        val patterns = listOf(
-            Regex("v=([a-zA-Z0-9_-]{11})"),
-            Regex("youtu\\.be/([a-zA-Z0-9_-]{11})"),
-            Regex("embed/([a-zA-Z0-9_-]{11})"),
-            Regex("shorts/([a-zA-Z0-9_-]{11})")
-        )
-        patterns.forEach { pattern ->
-            pattern.find(url)?.groupValues?.get(1)?.let { return it }
-        }
-        return null
-    }
-
-    private fun buildYoutubeFormats(videoId: String): List<VideoFormat> {
-        // These are the standard YouTube itag format identifiers
-        return listOf(
-            VideoFormat("137", "1080p", "1920x1080", 0, "mp4",
-                "https://api.socialdownloader.app/yt/$videoId/1080"),
-            VideoFormat("136", "720p", "1280x720", 0, "mp4",
-                "https://api.socialdownloader.app/yt/$videoId/720"),
-            VideoFormat("135", "480p", "854x480", 0, "mp4",
-                "https://api.socialdownloader.app/yt/$videoId/480"),
-            VideoFormat("134", "360p", "640x360", 0, "mp4",
-                "https://api.socialdownloader.app/yt/$videoId/360"),
-            VideoFormat("140", "Audio", "Audio Only", 0, "mp3",
-                "https://api.socialdownloader.app/yt/$videoId/audio", isAudioOnly = true)
-        )
-    }
-
-    // ─── TikTok ───────────────────────────────────────────────────────────────
-
-    private suspend fun extractTikTok(url: String): Result<VideoInfo> {
-        val resolvedUrl = resolveRedirects(url)
-        val doc = try {
-            Jsoup.connect(resolvedUrl)
-                .userAgent(MOBILE_USER_AGENT)
-                .timeout(15000)
-                .get()
-        } catch (e: Exception) {
-            return Result.failure(Exception("Failed to load TikTok page: ${e.message}"))
-        }
-
-        val title = doc.select("meta[property=og:title]").attr("content")
-            .ifEmpty { doc.title() }
-        val thumbnail = doc.select("meta[property=og:image]").attr("content")
-        val author = doc.select("meta[name=author]").attr("content")
-
-        val videoId = extractTikTokVideoId(resolvedUrl) ?: System.currentTimeMillis().toString()
-
-        val baseFormats = listOf(
-            VideoFormat("hd", "HD", "720p", 0, "mp4",
-                "https://api.socialdownloader.app/tt/$videoId/hd"),
-            VideoFormat("sd", "SD", "480p", 0, "mp4",
-                "https://api.socialdownloader.app/tt/$videoId/sd"),
-            VideoFormat("audio", "Audio", "Audio Only", 0, "mp3",
-                "https://api.socialdownloader.app/tt/$videoId/audio", isAudioOnly = true)
-        )
-        val formats = fetchFileSizes(baseFormats)
-
-        return Result.success(
-            VideoInfo(
-                id = videoId,
-                title = title,
-                description = "",
-                thumbnailUrl = thumbnail,
-                duration = 0,
-                platform = Platform.TIKTOK,
-                originalUrl = url,
-                uploader = author,
-                uploaderAvatarUrl = "",
-                viewCount = 0,
-                likeCount = 0,
-                formats = formats,
-                uploadDate = ""
-            )
-        )
-    }
-
-    private fun extractTikTokVideoId(url: String): String? {
-        return Regex("/video/(\\d+)").find(url)?.groupValues?.get(1)
-    }
-
-    // ─── Instagram ────────────────────────────────────────────────────────────
-
-    private suspend fun extractInstagram(url: String): Result<VideoInfo> {
-        val oembedUrl = "https://api.instagram.com/oembed/?url=$url&omitscript=true"
-        val json = fetchJson(oembedUrl)
-
-        val mediaId = extractInstagramMediaId(url) ?: System.currentTimeMillis().toString()
-        val title = json?.optString("title") ?: "Instagram Video"
-        val thumbnail = json?.optString("thumbnail_url") ?: ""
-        val author = json?.optString("author_name") ?: ""
-
-        val baseFormats = listOf(
-            VideoFormat("hd", "HD", "720p", 0, "mp4",
-                "https://api.socialdownloader.app/ig/$mediaId/hd"),
-            VideoFormat("sd", "SD", "480p", 0, "mp4",
-                "https://api.socialdownloader.app/ig/$mediaId/sd")
-        )
-        val formats = fetchFileSizes(baseFormats)
-
-        return Result.success(
-            VideoInfo(
-                id = mediaId,
-                title = title,
-                description = "",
-                thumbnailUrl = thumbnail,
-                duration = 0,
-                platform = Platform.INSTAGRAM,
-                originalUrl = url,
-                uploader = author,
-                uploaderAvatarUrl = "",
-                viewCount = 0,
-                likeCount = 0,
-                formats = formats,
-                uploadDate = ""
-            )
-        )
-    }
-
-    private fun extractInstagramMediaId(url: String): String? {
-        return Regex("/(p|reel|tv)/([A-Za-z0-9_-]+)").find(url)?.groupValues?.get(2)
-    }
-
-    // ─── Facebook ─────────────────────────────────────────────────────────────
-
-    private suspend fun extractFacebook(url: String): Result<VideoInfo> {
-        val oembedUrl = "https://www.facebook.com/plugins/video/oembed.json/?url=${
-            java.net.URLEncoder.encode(url, "UTF-8")
-        }"
-        val json = fetchJson(oembedUrl)
-
-        val videoId = extractFacebookVideoId(url) ?: System.currentTimeMillis().toString()
-        val title = json?.optString("title") ?: "Facebook Video"
-        val thumbnail = json?.optString("thumbnail_url") ?: ""
-        val author = json?.optString("author_name") ?: ""
-
-        val baseFormats = listOf(
-            VideoFormat("hd", "HD", "720p", 0, "mp4",
-                "https://api.socialdownloader.app/fb/$videoId/hd"),
-            VideoFormat("sd", "SD", "480p", 0, "mp4",
-                "https://api.socialdownloader.app/fb/$videoId/sd")
-        )
-        val formats = fetchFileSizes(baseFormats)
-
-        return Result.success(
-            VideoInfo(
-                id = videoId,
-                title = title,
-                description = "",
-                thumbnailUrl = thumbnail,
-                duration = 0,
-                platform = Platform.FACEBOOK,
-                originalUrl = url,
-                uploader = author,
-                uploaderAvatarUrl = "",
-                viewCount = 0,
-                likeCount = 0,
-                formats = formats,
-                uploadDate = ""
-            )
-        )
-    }
-
-    private fun extractFacebookVideoId(url: String): String? {
-        return Regex("videos/(\\d+)").find(url)?.groupValues?.get(1)
-            ?: Regex("v=(\\d+)").find(url)?.groupValues?.get(1)
-    }
-
-    // ─── Twitter / X ──────────────────────────────────────────────────────────
-
-    private suspend fun extractTwitter(url: String): Result<VideoInfo> {
-        val tweetId = Regex("status/(\\d+)").find(url)?.groupValues?.get(1)
-            ?: return Result.failure(Exception("Invalid Twitter URL"))
-
-        val baseFormats = listOf(
-            VideoFormat("hd", "HD", "720p", 0, "mp4",
-                "https://api.socialdownloader.app/tw/$tweetId/hd"),
-            VideoFormat("sd", "SD", "360p", 0, "mp4",
-                "https://api.socialdownloader.app/tw/$tweetId/sd")
-        )
-        val formats = fetchFileSizes(baseFormats)
-
-        return Result.success(
-            VideoInfo(
-                id = tweetId,
-                title = "Twitter / X Video",
-                description = "",
-                thumbnailUrl = "",
-                duration = 0,
-                platform = Platform.TWITTER,
-                originalUrl = url,
-                uploader = "",
-                uploaderAvatarUrl = "",
-                viewCount = 0,
-                likeCount = 0,
-                formats = formats,
-                uploadDate = ""
-            )
-        )
-    }
-
-    // ─── Vimeo ────────────────────────────────────────────────────────────────
-
-    private suspend fun extractVimeo(url: String): Result<VideoInfo> {
-        val videoId = Regex("vimeo\\.com/(\\d+)").find(url)?.groupValues?.get(1)
-            ?: return Result.failure(Exception("Invalid Vimeo URL"))
-
-        val oembedUrl = "https://vimeo.com/api/oembed.json?url=https://vimeo.com/$videoId"
-        val json = fetchJson(oembedUrl)
-
-        val title = json?.optString("title") ?: "Vimeo Video"
-        val thumbnail = json?.optString("thumbnail_url") ?: ""
-        val author = json?.optString("author_name") ?: ""
-        val duration = json?.optInt("duration", 0)?.toLong() ?: 0
-
-        val baseFormats = listOf(
-            VideoFormat("1080p", "1080p", "1920x1080", 0, "mp4",
-                "https://api.socialdownloader.app/vm/$videoId/1080"),
-            VideoFormat("720p", "720p", "1280x720", 0, "mp4",
-                "https://api.socialdownloader.app/vm/$videoId/720"),
-            VideoFormat("360p", "360p", "640x360", 0, "mp4",
-                "https://api.socialdownloader.app/vm/$videoId/360")
-        )
-        val formats = fetchFileSizes(baseFormats)
-
-        return Result.success(
-            VideoInfo(
-                id = videoId,
-                title = title,
-                description = "",
-                thumbnailUrl = thumbnail,
-                duration = duration,
-                platform = Platform.VIMEO,
-                originalUrl = url,
-                uploader = author,
-                uploaderAvatarUrl = "",
-                viewCount = 0,
-                likeCount = 0,
-                formats = formats,
-                uploadDate = ""
-            )
-        )
-    }
-
-    // ─── Dailymotion ──────────────────────────────────────────────────────────
-
-    private suspend fun extractDailymotion(url: String): Result<VideoInfo> {
-        val videoId = Regex("video/([a-z0-9]+)").find(url)?.groupValues?.get(1)
-            ?: return Result.failure(Exception("Invalid Dailymotion URL"))
-
-        val apiUrl = "https://api.dailymotion.com/video/$videoId?fields=title,thumbnail_url,duration,owner.screenname,views_total"
-        val json = fetchJson(apiUrl)
-
-        val title = json?.optString("title") ?: "Dailymotion Video"
-        val thumbnail = json?.optString("thumbnail_url") ?: ""
-        val duration = json?.optLong("duration") ?: 0
-        val views = json?.optLong("views_total") ?: 0
-
-        val baseFormats = listOf(
-            VideoFormat("720p", "HD", "1280x720", 0, "mp4",
-                "https://api.socialdownloader.app/dm/$videoId/720"),
-            VideoFormat("480p", "SD", "854x480", 0, "mp4",
-                "https://api.socialdownloader.app/dm/$videoId/480")
-        )
-        val formats = fetchFileSizes(baseFormats)
-
-        return Result.success(
-            VideoInfo(
-                id = videoId,
-                title = title,
-                description = "",
-                thumbnailUrl = thumbnail,
-                duration = duration,
-                platform = Platform.DAILYMOTION,
-                originalUrl = url,
-                uploader = json?.optString("owner.screenname") ?: "",
-                uploaderAvatarUrl = "",
-                viewCount = views,
-                likeCount = 0,
-                formats = formats,
-                uploadDate = ""
-            )
-        )
-    }
-
-    // ─── Reddit ───────────────────────────────────────────────────────────────
-
-    private suspend fun extractReddit(url: String): Result<VideoInfo> {
-        val cleanUrl = url.trimEnd('/')
-        val jsonUrl = "$cleanUrl.json"
-        val json = fetchJson(jsonUrl) ?: return Result.failure(Exception("Failed to fetch Reddit data"))
-
-        // Reddit JSON has nested structure
-        val postId = Regex("comments/([a-z0-9]+)").find(url)?.groupValues?.get(1)
-            ?: System.currentTimeMillis().toString()
-
-        val baseFormats = listOf(
-            VideoFormat("hd", "HD", "720p", 0, "mp4",
-                "https://api.socialdownloader.app/rd/$postId/hd"),
-            VideoFormat("sd", "SD", "480p", 0, "mp4",
-                "https://api.socialdownloader.app/rd/$postId/sd")
-        )
-        val formats = fetchFileSizes(baseFormats)
-
-        return Result.success(
-            VideoInfo(
-                id = postId,
-                title = "Reddit Video",
-                description = "",
-                thumbnailUrl = "",
-                duration = 0,
-                platform = Platform.REDDIT,
-                originalUrl = url,
-                uploader = "",
-                uploaderAvatarUrl = "",
-                viewCount = 0,
-                likeCount = 0,
-                formats = formats,
-                uploadDate = ""
-            )
-        )
-    }
-
-    // ─── Generic Extractor ────────────────────────────────────────────────────
-
-    private suspend fun extractGeneric(url: String, platform: Platform): Result<VideoInfo> {
-        val doc = try {
-            Jsoup.connect(url)
+    private fun fetchPageMetadata(url: String, platform: Platform): PageMetadata {
+        return try {
+            val doc = Jsoup.connect(url)
                 .userAgent(DESKTOP_USER_AGENT)
                 .timeout(15000)
+                .followRedirects(true)
                 .get()
-        } catch (e: Exception) {
-            return Result.failure(Exception("Cannot access the page: ${e.message}"))
-        }
 
-        val title = doc.select("meta[property=og:title]").attr("content")
-            .ifEmpty { doc.title() }
-        val thumbnail = doc.select("meta[property=og:image]").attr("content")
-        val videoUrl = doc.select("meta[property=og:video:url], meta[property=og:video]")
-            .attr("content")
+            val title = doc.select("meta[property=og:title]").attr("content")
+                .ifEmpty { doc.select("title").text() }
+                .ifEmpty { "Video" }
+            
+            val thumbnail = doc.select("meta[property=og:image]").attr("content")
+                .ifEmpty { "" }
+            
+            val author = when (platform) {
+                Platform.YOUTUBE -> doc.select("link[itemprop=name]").attr("content")
+                    .ifEmpty { doc.select("meta[name=author]").attr("content") }
+                else -> doc.select("meta[name=author]").attr("content")
+            }.ifEmpty { "Unknown" }
 
-        if (videoUrl.isEmpty()) {
-            return Result.failure(Exception("No video found on this page"))
-        }
-
-        val baseFormats = listOf(
-            VideoFormat("default", "Default", "auto", 0, "mp4", videoUrl)
-        )
-        val formats = fetchFileSizes(baseFormats)
-
-        return Result.success(
-            VideoInfo(
-                id = System.currentTimeMillis().toString(),
+            val videoId = extractVideoId(url, platform) ?: System.currentTimeMillis().toString()
+            
+            PageMetadata(
+                id = videoId,
                 title = title,
-                description = "",
-                thumbnailUrl = thumbnail,
+                thumbnail = thumbnail,
                 duration = 0,
-                platform = platform,
-                originalUrl = url,
-                uploader = "",
-                uploaderAvatarUrl = "",
-                viewCount = 0,
-                likeCount = 0,
-                formats = formats,
-                uploadDate = ""
+                author = author
             )
-        )
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to fetch page metadata")
+            PageMetadata(
+                id = System.currentTimeMillis().toString(),
+                title = "Video",
+                thumbnail = "",
+                duration = 0,
+                author = "Unknown"
+            )
+        }
     }
 
-    // ─── Helpers ──────────────────────────────────────────────────────────────
-
-    private fun fetchJson(url: String): org.json.JSONObject? {
-        return try {
-            val request = Request.Builder()
-                .url(url)
-                .addHeader("User-Agent", DESKTOP_USER_AGENT)
-                .build()
-            val response = okHttpClient.newCall(request).execute()
-            if (response.isSuccessful) {
-                val body = response.body?.string() ?: return null
-                // Handle both JSON array and object
-                if (body.trimStart().startsWith("[")) {
-                    org.json.JSONArray(body).optJSONObject(0)
-                } else {
-                    org.json.JSONObject(body)
+    private fun extractVideoId(url: String, platform: Platform): String? {
+        return when (platform) {
+            Platform.YOUTUBE -> {
+                val patterns = listOf(
+                    Regex("v=([a-zA-Z0-9_-]{11})"),
+                    Regex("youtu\\.be/([a-zA-Z0-9_-]{11})"),
+                    Regex("embed/([a-zA-Z0-9_-]{11})"),
+                    Regex("shorts/([a-zA-Z0-9_-]{11})")
+                )
+                patterns.forEach { pattern ->
+                    pattern.find(url)?.groupValues?.get(1)?.let { return it }
                 }
-            } else null
+                null
+            }
+            Platform.TIKTOK -> Regex("/video/(\\d+)").find(url)?.groupValues?.get(1)
+            Platform.INSTAGRAM -> Regex("/(p|reel|tv)/([A-Za-z0-9_-]+)").find(url)?.groupValues?.get(2)
+            Platform.FACEBOOK -> Regex("videos/(\\d+)").find(url)?.groupValues?.get(1)
+                ?: Regex("v=(\\d+)").find(url)?.groupValues?.get(1)
+            Platform.TWITTER -> Regex("status/(\\d+)").find(url)?.groupValues?.get(1)
+            Platform.VIMEO -> Regex("vimeo\\.com/(\\d+)").find(url)?.groupValues?.get(1)
+            Platform.DAILYMOTION -> Regex("video/([a-z0-9]+)").find(url)?.groupValues?.get(1)
+            Platform.REDDIT -> Regex("comments/([a-z0-9]+)").find(url)?.groupValues?.get(1)
+            else -> null
+        }
+    }
+
+    private fun fetchFromCobalt(url: String): List<VideoFormat>? {
+        return try {
+            val jsonBody = JSONObject().apply {
+                put("url", url)
+                put("vCodec", "h264")
+                put("aCodec", "mp3")
+                put("videoQuality", "1080")
+                put("audioQuality", "320")
+                put("filenameStyle", "classic")
+                put("tiktokFullAudio", true)
+                put("twitterGif", true)
+            }
+
+            val requestBody = jsonBody.toString()
+                .toRequestBody("application/json".toMediaType())
+
+            val request = Request.Builder()
+                .url(COBALT_API)
+                .post(requestBody)
+                .addHeader("Accept", "application/json")
+                .addHeader("User-Agent", "SocialDownloader/1.0")
+                .build()
+
+            val response = okHttpClient.newCall(request).execute()
+            
+            if (!response.isSuccessful) {
+                Timber.w("Cobalt API failed with code: ${response.code}")
+                return null
+            }
+
+            val responseBody = response.body?.string()
+            if (responseBody.isNullOrEmpty()) {
+                Timber.w("Empty response from Cobalt API")
+                return null
+            }
+
+            val json = JSONObject(responseBody)
+            parseCobaltResponse(json)
         } catch (e: Exception) {
-            Timber.e(e, "Failed to fetch JSON from $url")
+            Timber.e(e, "Failed to fetch from Cobalt API")
             null
         }
     }
 
-    private fun resolveRedirects(url: String): String {
-        return try {
-            val request = Request.Builder()
-                .url(url)
-                .addHeader("User-Agent", MOBILE_USER_AGENT)
-                .build()
-            val response = okHttpClient.newCall(request).execute()
-            response.request.url.toString()
-        } catch (e: Exception) {
-            url
+    private fun parseCobaltResponse(json: JSONObject): List<VideoFormat>? {
+        val status = json.optString("status", "error")
+        
+        return when (status) {
+            "redirect" -> {
+                // Direct URL
+                val url = json.optString("url", "")
+                if (url.isNotEmpty()) {
+                    val filename = json.optString("filename", "video")
+                    val isAudio = filename.contains(".mp3") || url.contains("audio")
+                    listOf(
+                        VideoFormat(
+                            formatId = "default",
+                            quality = if (isAudio) "Audio" else "Best",
+                            resolution = if (isAudio) "Audio Only" else "Best Quality",
+                            fileSize = 0,
+                            extension = if (isAudio) "mp3" else "mp4",
+                            url = url,
+                            isAudioOnly = isAudio
+                        )
+                    )
+                } else null
+            }
+            "stream" -> {
+                // Stream URL
+                val url = json.optString("url", "")
+                if (url.isNotEmpty()) {
+                    listOf(
+                        VideoFormat(
+                            formatId = "stream",
+                            quality = "Best",
+                            resolution = "Best Quality",
+                            fileSize = 0,
+                            extension = "mp4",
+                            url = url,
+                            isAudioOnly = false
+                        )
+                    )
+                } else null
+            }
+            "picker" -> {
+                // Multiple formats available
+                val picker = json.optJSONArray("picker") ?: return null
+                val formats = mutableListOf<VideoFormat>()
+                
+                for (i in 0 until picker.length()) {
+                    val item = picker.optJSONObject(i) ?: continue
+                    val type = item.optString("type", "video")
+                    val url = item.optString("url", "")
+                    
+                    if (url.isNotEmpty()) {
+                        val isAudio = type == "audio"
+                        formats.add(
+                            VideoFormat(
+                                formatId = "picker_$i",
+                                quality = item.optString("quality", if (isAudio) "Audio" else "Video"),
+                                resolution = if (isAudio) "Audio Only" else item.optString("quality", "Unknown"),
+                                fileSize = 0,
+                                extension = if (isAudio) "mp3" else "mp4",
+                                url = url,
+                                isAudioOnly = isAudio
+                            )
+                        )
+                    }
+                }
+                
+                if (formats.isEmpty()) null else formats
+            }
+            else -> {
+                val error = json.optString("error", "Unknown error")
+                Timber.w("Cobalt API error: $error")
+                null
+            }
         }
-    }
-
-    // Extension to safely get optString from JSONObject
-    private fun org.json.JSONObject.optString(key: String, fallback: String = ""): String =
-        if (has(key) && !isNull(key)) getString(key) else fallback
-
-    companion object {
-        private const val DESKTOP_USER_AGENT =
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
-        private const val MOBILE_USER_AGENT =
-            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Mobile Safari/537.36"
     }
 }

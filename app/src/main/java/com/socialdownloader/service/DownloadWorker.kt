@@ -22,6 +22,8 @@ import okhttp3.Request
 import timber.log.Timber
 import java.io.File
 import java.io.FileOutputStream
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 
 @HiltWorker
 class DownloadWorker @AssistedInject constructor(
@@ -37,10 +39,21 @@ class DownloadWorker @AssistedInject constructor(
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         val downloadId = inputData.getLong(KEY_DOWNLOAD_ID, -1)
         val downloadUrl = inputData.getString(KEY_DOWNLOAD_URL) ?: return@withContext Result.failure()
-        val fileName = inputData.getString(KEY_FILE_NAME) ?: "download.mp4"
+        val fileName = inputData.getString(KEY_FILE_NAME) ?: "download_${System.currentTimeMillis()}.mp4"
         val isAudio = inputData.getBoolean(KEY_IS_AUDIO, false)
 
-        if (downloadId == -1L) return@withContext Result.failure()
+        Timber.d("Starting download: id=$downloadId, url=$downloadUrl, fileName=$fileName")
+
+        if (downloadId == -1L) {
+            Timber.e("Invalid download ID")
+            return@withContext Result.failure()
+        }
+
+        if (downloadUrl.isEmpty()) {
+            Timber.e("Empty download URL")
+            repository.markFailed(downloadId, "Invalid download URL")
+            return@withContext Result.failure()
+        }
 
         val notificationId = downloadId.toInt() + NOTIFICATION_ID_BASE
 
@@ -60,60 +73,77 @@ class DownloadWorker @AssistedInject constructor(
                     "SocialDownloader"
                 )
             }
-            saveDir.mkdirs()
+            
+            if (!saveDir.exists()) {
+                val created = saveDir.mkdirs()
+                Timber.d("Save directory created: $created, path: ${saveDir.absolutePath}")
+            }
 
             val outputFile = File(saveDir, fileName)
 
-            // Execute download
+            // Build request with proper headers
             val request = Request.Builder()
                 .url(downloadUrl)
-                .addHeader("User-Agent", "Mozilla/5.0 (Android) SocialDownloader/1.0")
+                .addHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36")
+                .addHeader("Accept", "*/*")
+                .addHeader("Accept-Encoding", "identity") // Disable compression for accurate size
                 .build()
 
+            Timber.d("Executing download request...")
             val response = okHttpClient.newCall(request).execute()
 
             if (!response.isSuccessful) {
-                repository.markFailed(downloadId, "Server error: ${response.code}")
+                val errorMsg = "Server error: ${response.code} ${response.message}"
+                Timber.e(errorMsg)
+                repository.markFailed(downloadId, errorMsg)
                 showFailedNotification(notificationId, fileName)
                 return@withContext Result.failure()
             }
 
             val body = response.body ?: run {
-                repository.markFailed(downloadId, "Empty response body")
+                Timber.e("Empty response body")
+                repository.markFailed(downloadId, "Empty response from server")
                 showFailedNotification(notificationId, fileName)
                 return@withContext Result.failure()
             }
 
             val contentLength = body.contentLength()
+            Timber.d("Content length: $contentLength bytes")
             
-            // Update file size in database if we got a valid content length
+            // Update file size in database
             if (contentLength > 0) {
                 repository.updateFileSize(downloadId, contentLength)
             }
             
             var downloadedBytes = 0L
+            var lastProgressUpdate = 0
 
             FileOutputStream(outputFile).use { outputStream ->
                 body.byteStream().use { inputStream ->
                     val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                     var bytesRead: Int
-                    var lastProgressUpdate = 0
 
                     while (inputStream.read(buffer).also { bytesRead = it } != -1) {
                         outputStream.write(buffer, 0, bytesRead)
                         downloadedBytes += bytesRead
 
-                        // Update progress every 2%
+                        // Update progress every 5% or every 1MB
                         val progress = if (contentLength > 0) {
                             ((downloadedBytes.toFloat() / contentLength) * 100).toInt()
-                        } else -1
+                        } else {
+                            // Show indeterminate progress
+                            -1
+                        }
 
-                        if (progress - lastProgressUpdate >= 2 || progress == 100) {
-                            lastProgressUpdate = progress
+                        val shouldUpdate = progress >= 0 && (progress - lastProgressUpdate >= 5 || progress == 100) ||
+                                (progress < 0 && downloadedBytes - lastProgressUpdate * 1024 * 1024 / 5 >= 1024 * 1024)
+
+                        if (shouldUpdate) {
+                            lastProgressUpdate = if (progress >= 0) progress else (downloadedBytes / (1024 * 1024)).toInt()
                             repository.updateProgress(downloadId, downloadedBytes, DownloadStatus.DOWNLOADING)
                             showProgressNotification(notificationId, fileName, progress)
 
-                            setProgress(
+                            setProgressAsync(
                                 workDataOf(
                                     KEY_PROGRESS to progress,
                                     KEY_DOWNLOADED_BYTES to downloadedBytes,
@@ -124,6 +154,8 @@ class DownloadWorker @AssistedInject constructor(
 
                         // Check if cancelled
                         if (isStopped) {
+                            Timber.d("Download cancelled by user")
+                            outputStream.close()
                             outputFile.delete()
                             repository.cancelDownload(downloadId)
                             return@withContext Result.failure()
@@ -132,14 +164,22 @@ class DownloadWorker @AssistedInject constructor(
                 }
             }
 
+            // Verify file was written
+            if (!outputFile.exists() || outputFile.length() == 0L) {
+                Timber.e("File was not created or is empty")
+                repository.markFailed(downloadId, "Download failed: File is empty")
+                showFailedNotification(notificationId, fileName)
+                return@withContext Result.failure()
+            }
+
             // Success!
+            Timber.d("Download completed: ${outputFile.absolutePath}, size: ${outputFile.length()}")
             repository.markCompleted(downloadId, outputFile.absolutePath)
             showCompleteNotification(notificationId, fileName, outputFile)
 
             // Scan file to media library
             scanMediaFile(outputFile)
 
-            Timber.d("Download completed: $fileName")
             Result.success(
                 workDataOf(
                     KEY_FILE_PATH to outputFile.absolutePath,
@@ -147,27 +187,38 @@ class DownloadWorker @AssistedInject constructor(
                 )
             )
 
-        } catch (e: Exception) {
-            Timber.e(e, "Download failed for id: $downloadId")
-            repository.markFailed(downloadId, e.message ?: "Unknown error")
+        } catch (e: SocketTimeoutException) {
+            Timber.e(e, "Download timeout")
+            repository.markFailed(downloadId, "Connection timed out")
             showFailedNotification(notificationId, fileName)
-            Result.failure(workDataOf(KEY_ERROR to (e.message ?: "Unknown error")))
+            Result.retry()
+        } catch (e: UnknownHostException) {
+            Timber.e(e, "No internet connection")
+            repository.markFailed(downloadId, "No internet connection")
+            showFailedNotification(notificationId, fileName)
+            Result.retry()
+        } catch (e: Exception) {
+            Timber.e(e, "Download failed")
+            val errorMsg = e.message ?: "Unknown error occurred"
+            repository.markFailed(downloadId, errorMsg.take(100))
+            showFailedNotification(notificationId, fileName)
+            Result.failure(workDataOf(KEY_ERROR to errorMsg))
         }
     }
-
-    // ─── Notifications ────────────────────────────────────────────────────────
 
     private fun showProgressNotification(notificationId: Int, fileName: String, progress: Int) {
         val notification = NotificationCompat.Builder(context, SocialDownloaderApp.CHANNEL_DOWNLOAD)
             .setSmallIcon(android.R.drawable.stat_sys_download)
             .setContentTitle("Downloading")
-            .setContentText(fileName)
+            .setContentText(fileName.take(50))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setProgress(100, progress, progress < 0)
+            .setProgress(100, if (progress >= 0) progress else 0, progress < 0)
             .apply {
                 if (progress >= 0) {
                     setSubText("$progress%")
+                } else {
+                    setSubText("Downloading...")
                 }
             }
             .build()
@@ -190,7 +241,7 @@ class DownloadWorker @AssistedInject constructor(
         val notification = NotificationCompat.Builder(context, SocialDownloaderApp.CHANNEL_COMPLETE)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentTitle("Download Complete")
-            .setContentText(fileName)
+            .setContentText(fileName.take(50))
             .setAutoCancel(true)
             .setContentIntent(pendingIntent)
             .build()
@@ -202,7 +253,7 @@ class DownloadWorker @AssistedInject constructor(
         val notification = NotificationCompat.Builder(context, SocialDownloaderApp.CHANNEL_ERROR)
             .setSmallIcon(android.R.drawable.stat_notify_error)
             .setContentTitle("Download Failed")
-            .setContentText(fileName)
+            .setContentText(fileName.take(50))
             .setAutoCancel(true)
             .build()
 
@@ -210,12 +261,16 @@ class DownloadWorker @AssistedInject constructor(
     }
 
     private fun scanMediaFile(file: File) {
-        android.media.MediaScannerConnection.scanFile(
-            context,
-            arrayOf(file.absolutePath),
-            null,
-            null
-        )
+        try {
+            android.media.MediaScannerConnection.scanFile(
+                context,
+                arrayOf(file.absolutePath),
+                null,
+                null
+            )
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to scan media file")
+        }
     }
 
     companion object {

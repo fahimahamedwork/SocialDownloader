@@ -5,6 +5,7 @@ import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.Preferences
 import androidx.datastore.preferences.preferencesDataStore
 import androidx.room.Room
+import androidx.work.Configuration
 import androidx.work.WorkManager
 import com.socialdownloader.data.AppDatabase
 import com.socialdownloader.data.network.VideoExtractorService
@@ -16,6 +17,7 @@ import dagger.hilt.components.SingletonComponent
 import okhttp3.Cache
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
+import timber.log.Timber
 import java.io.File
 import java.util.concurrent.TimeUnit
 import javax.inject.Singleton
@@ -35,6 +37,18 @@ object AppModule {
     @Provides
     @Singleton
     fun provideWorkManager(@ApplicationContext context: Context): WorkManager {
+        // Initialize WorkManager if not already initialized
+        val config = Configuration.Builder()
+            .setMinimumLoggingLevel(android.util.Log.INFO)
+            .build()
+        
+        try {
+            WorkManager.initialize(context, config)
+        } catch (e: IllegalStateException) {
+            // Already initialized, ignore
+            Timber.d("WorkManager already initialized")
+        }
+        
         return WorkManager.getInstance(context)
     }
 
@@ -45,21 +59,22 @@ object AppModule {
         val cache = Cache(cacheDir, 50 * 1024 * 1024) // 50 MB cache
 
         val loggingInterceptor = HttpLoggingInterceptor().apply {
-            level = HttpLoggingInterceptor.Level.HEADERS
+            level = HttpLoggingInterceptor.Level.BASIC
         }
 
         return OkHttpClient.Builder()
             .cache(cache)
-            .connectTimeout(30, TimeUnit.SECONDS)
+            .connectTimeout(60, TimeUnit.SECONDS)
             .readTimeout(120, TimeUnit.SECONDS)
             .writeTimeout(120, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
+            .retryOnConnectionFailure(true)
             .addInterceptor(loggingInterceptor)
             .addInterceptor { chain ->
                 val request = chain.request().newBuilder()
                     .addHeader("Accept-Language", "en-US,en;q=0.9")
-                    .addHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
+                    .addHeader("Accept", "*/*")
                     .build()
                 chain.proceed(request)
             }
