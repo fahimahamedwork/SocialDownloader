@@ -28,11 +28,32 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
+      - name: Verify Project Structure
+        run: |
+          echo "Current directory:"
+          pwd
+          echo ""
+          echo "Files in current directory:"
+          ls -la
+          echo ""
+          echo "Gradle wrapper:"
+          ls -la gradle/wrapper/
+          echo ""
+          echo "App directory:"
+          ls -la app/
+          echo ""
+          echo "Checking gradlew..."
+          file gradlew
+
+      - name: Gradle Version
+        run: ./gradlew --version
+
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace
+        run: ./gradlew assembleDebug --no-daemon --stacktrace --info 2>&1 | head -500
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
+        if: success()
         with:
           name: debug-apk
           path: app/build/outputs/apk/debug/*.apk
