@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<navigation
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/nav_graph"
+    app:startDestination="@id/homeFragment">
+
+    <fragment
+        android:id="@+id/homeFragment"
+        android:name="com.socialdownloader.ui.home.HomeFragment"
+        android:label="Home" />
+
+    <fragment
+        android:id="@+id/downloadsFragment"
+        android:name="com.socialdownloader.ui.download.DownloadsFragment"
+        android:label="Downloads" />
+
+    <fragment
+        android:id="@+id/libraryFragment"
+        android:name="com.socialdownloader.ui.library.LibraryFragment"
+        android:label="Library" />
+
+    <fragment
+        android:id="@+id/settingsFragment"
+        android:name="com.socialdownloader.ui.settings.SettingsFragment"
+        android:label="Settings" />
+
+</navigation>
