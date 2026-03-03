@@ -1,4 +1,4 @@
-# Simplified GitHub Actions CI/CD Workflow
+# GitHub Actions CI/CD Workflow for SocialDownloader
 name: Android CI/CD
 
 on:
@@ -6,6 +6,7 @@ on:
     branches: [main, master, develop]
   pull_request:
     branches: [main, master, develop]
+  workflow_dispatch:
 
 jobs:
   build:
@@ -28,32 +29,19 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      - name: Verify Project Structure
-        run: |
-          echo "Current directory:"
-          pwd
-          echo ""
-          echo "Files in current directory:"
-          ls -la
-          echo ""
-          echo "Gradle wrapper:"
-          ls -la gradle/wrapper/
-          echo ""
-          echo "App directory:"
-          ls -la app/
-          echo ""
-          echo "Checking gradlew..."
-          file gradlew
-
-      - name: Gradle Version
-        run: ./gradlew --version
-
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --stacktrace --info 2>&1 | head -500
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: List APK files
+        run: |
+          echo "Checking APK files..."
+          ls -la app/build/outputs/apk/debug/ || echo "APK directory not found"
+          find app/build/outputs -name "*.apk" || echo "No APK files found"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
-        if: success()
         with:
           name: debug-apk
           path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: warn
+          retention-days: 14
